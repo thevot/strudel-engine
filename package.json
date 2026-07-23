@@ -1,0 +1,30 @@
+{
+  "name": "@strudel-daw/engine",
+  "version": "1.0.0",
+  "description": "Open Source AGPLv3 Audio Engine and IPC Driver for Strudel Live Coding DAW Integration",
+  "main": "index.js",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strudel-daw/strudel-engine.git"
+  },
+  "keywords": [
+    "strudel",
+    "live-coding",
+    "web-audio",
+    "daw",
+    "agplv3",
+    "audio-engine"
+  ],
+  "author": "StruDAW Core Team & Strudel Contributors",
+  "license": "AGPL-3.0-only",
+  "bugs": {
+    "url": "https://github.com/strudel-daw/strudel-engine/issues"
+  },
+  "homepage": "https://github.com/strudel-daw/strudel-engine#readme",
+  "peerDependencies": {
+    "@strudel/core": "^1.2.6",
+    "@strudel/soundfonts": "^1.3.0",
+    "@strudel/web": "^1.3.0"
+  }
+}
