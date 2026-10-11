@@ -71,6 +71,11 @@ class EngineMessageDispatcher extends EventTarget {
           };
           break;
 
+        case ENGINE_ACTIONS.REGISTER_SAMPLE:
+          await AGPLBridge.registerSample(payload.name, payload.urlOrData);
+          result = { registered: true, name: payload.name };
+          break;
+
         default:
           throw new Error(`Unknown engine action: ${action}`);
       }

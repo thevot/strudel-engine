@@ -169,6 +169,24 @@ export async function evaluateAll(tracks, bpm, options = {}) {
     if (pan !== 0) {
       wrapped += `.pan(${pan.toFixed(2)})`;
     }
+    if (Array.isArray(t.sends)) {
+      if (t.sends[0] > 0) wrapped += `.room(${t.sends[0].toFixed(2)})`;
+      if (t.sends[1] > 0) wrapped += `.delay(${t.sends[1].toFixed(2)})`;
+    }
+    if (Array.isArray(t.inserts)) {
+      const INSERT_EFFECTS = {
+        LPF: '.lpf(1000)',
+        HPF: '.hpf(500)',
+        Room: '.room(0.5)',
+        Distort: '.distort(1.5)',
+        Delay: '.delay(0.3)',
+      };
+      for (const ins of t.inserts) {
+        if (ins && INSERT_EFFECTS[ins]) {
+          wrapped += `${INSERT_EFFECTS[ins]}`;
+        }
+      }
+    }
     return wrapped;
   }).filter(Boolean);
 
@@ -204,9 +222,10 @@ export async function evaluateAll(tracks, bpm, options = {}) {
 
 export async function stop() {
   try {
+    if (!initialized) return;
     await strudelEvaluate('hush()');
   } catch (err) {
-    console.error('[AGPLBridge] Stop error:', err);
+    console.warn('[AGPLBridge] Stop error (safe catch):', err?.message || String(err));
   }
 }
 
@@ -428,3 +447,14 @@ export async function previewDrum(sampleName) {
     await strudelEvaluate(`sound("${sampleName}").bank("RolandTR808").room(0.1)`);
   } catch { /* ignore */ }
 }
+
+export async function registerSample(name, urlOrData) {
+  try {
+    await samples({ [name]: urlOrData });
+    return { name, registered: true };
+  } catch (err) {
+    console.warn('[AGPLBridge] Failed to register sample:', name, err);
+    throw err;
+  }
+}
+
