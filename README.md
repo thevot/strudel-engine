@@ -1,5 +1,8 @@
 # @strudel-daw/engine 🎵
 
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?style=flat&logo=github-sponsors)](https://github.com/sponsors/thevot)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 **High-Performance Open Source AGPLv3 Audio Engine & IPC Protocol Driver for Strudel Live Coding DAW Systems.**
 
 > 🌐 **Powered in Production**: `@strudel-daw/engine` is the core audio engine driving **[StruDAW (strudaw.com)](https://strudaw.com)** — the browser-based Digital Audio Workstation for Strudel live coding.
@@ -61,6 +64,16 @@ const tracks = [
 // Evaluate all active tracks stacked with DAW BPM and metronome tick
 await evaluateAll(tracks, 128, { metronome: true });
 ```
+
+---
+
+## 💖 Support & Sponsorship
+
+`@strudel-daw/engine` and StruDAW are developed and maintained independently by **Nicola Selenu ([@thevot](https://github.com/thevot))**.
+
+If this open-source engine powers your live coding workflow or audio research, consider supporting ongoing maintenance via **[GitHub Sponsors](https://github.com/sponsors/thevot)**:
+
+- ☕ **Support on GitHub Sponsors**: [github.com/sponsors/thevot](https://github.com/sponsors/thevot)
 
 ---
 
