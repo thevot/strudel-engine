@@ -49,7 +49,7 @@ class EngineMessageDispatcher extends EventTarget {
           break;
 
         case ENGINE_ACTIONS.PREVIEW_DRUM:
-          await AGPLBridge.previewDrum(payload.sampleName);
+          await AGPLBridge.previewDrum(payload.sampleName, payload.bank, payload.note);
           result = { previewed: true };
           break;
 
@@ -67,7 +67,7 @@ class EngineMessageDispatcher extends EventTarget {
           result = {
             initialized: AGPLBridge.isInitialized(),
             currentCps: AGPLBridge.getCurrentCps(),
-            playbackStartTime: AGPLBridge.getPlaybackStartTime(),
+            cyclePosition: AGPLBridge.getCyclePosition(),
           };
           break;
 

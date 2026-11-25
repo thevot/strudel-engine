@@ -15,12 +15,15 @@ import {
   getAudioContext as getStrudelCtx,
 } from '@strudel/web';
 import { registerSoundfonts } from '@strudel/soundfonts';
+import { createTransportClock } from './transportClock.js';
 
 let initialized = false;
 let ctx = null;       // AudioContext
 let analyser = null;  // AnalyserNode for visualizations
 let masterTap = null; // GainNode mirroring the master bus
-let playbackStartTime = 0;
+let repl = null;      // Strudel repl: owns the scheduler
+let patternVersion = 0; // bumped whenever new code takes over the scheduler
+const transportClock = createTransportClock();
 let currentCps = 0.5;
 let engineIsPlaying = false;
 let activePreviewHandle = null;
@@ -31,7 +34,7 @@ export async function init() {
 
   const STRUDEL_CDN = 'https://strudel.b-cdn.net';
 
-  await initStrudel({
+  repl = await initStrudel({
     prebake: async () => {
       const optional = (label, promise) =>
         promise.catch((err) => console.warn(`[AGPLBridge] ${label} unavailable:`, err.message));
@@ -120,8 +123,8 @@ export async function init() {
 export async function evaluate(code) {
   try {
     if (!initialized) await init();
+    patternVersion += 1;
     await strudelEvaluate(code);
-    if (ctx) playbackStartTime = ctx.currentTime;
     return { error: null };
   } catch (err) {
     console.error('[AGPLBridge] Evaluation error:', err);
@@ -210,8 +213,8 @@ export async function evaluateAll(tracks, bpm, options = {}) {
   }
 
   try {
+    patternVersion += 1;
     await strudelEvaluate(combined);
-    if (ctx) playbackStartTime = ctx.currentTime;
     currentCps = bpmToCps(bpm || 120);
     return { error: null };
   } catch (err) {
@@ -223,7 +226,11 @@ export async function evaluateAll(tracks, bpm, options = {}) {
 export async function stop() {
   try {
     if (!initialized) return;
-    await strudelEvaluate('hush()');
+    // The scheduler itself must stop: `hush()` only swaps in silence and leaves the
+    // cycle counter running, so the next Play would start at an arbitrary point.
+    if (repl?.stop) repl.stop();
+    else await strudelEvaluate('hush()');
+    transportClock.reset();
   } catch (err) {
     console.warn('[AGPLBridge] Stop error (safe catch):', err?.message || String(err));
   }
@@ -407,7 +414,10 @@ export async function previewSound(sampleName) {
 
 export async function setCps(cps) {
   try {
-    await strudelEvaluate(`setcps(${cps})`);
+    // Set the tempo on the scheduler: evaluating `setcps()` as code would replace the
+    // running pattern with silence (and start a stopped scheduler).
+    if (repl?.scheduler) repl.scheduler.setCps(cps);
+    else await strudelEvaluate(`setcps(${cps})`);
   } catch (err) {
     console.error('[AGPLBridge] setCps error:', err);
   }
@@ -419,8 +429,9 @@ export function getAudioContext() { return ctx; }
 export function getAnalyser() { return analyser; }
 export function getMasterTap() { return masterTap; }
 export function isInitialized() { return initialized; }
-export function getPlaybackStartTime() { return playbackStartTime; }
-export function getCurrentCps() { return currentCps; }
+export function getCyclePosition() { return transportClock.position(repl?.scheduler, ctx); }
+export function getPatternVersion() { return patternVersion; }
+export function getCurrentCps() { return repl?.scheduler?.cps ?? currentCps; }
 export function setEnginePlayState(playing) { engineIsPlaying = playing; }
 
 export function previewNote(midiNote, durationSec = 0.35) {
@@ -441,10 +452,67 @@ export function previewNote(midiNote, durationSec = 0.35) {
   } catch { /* ignore */ }
 }
 
-export async function previewDrum(sampleName) {
-  if (engineIsPlaying || !initialized) return;
+const PREVIEW_WAVEFORMS = ['sawtooth', 'square', 'triangle', 'sine'];
+/** superdough drops sounds scheduled in the past: leave it a few ms of headroom. */
+const PREVIEW_LEAD_SEC = 0.01;
+/** A sample that took longer than this to download is no longer a response to the click. */
+const PREVIEW_MAX_WAIT_MS = 1500;
+const SAFE_BANK = /^[A-Za-z0-9_]+$/;
+const SAFE_SAMPLE = /^[A-Za-z0-9_]+(:[0-9]{1,2})?$/;
+
+/** `bd:3` on bank X → the same sound a pattern's `.bank(X)` would trigger. */
+function resolveDrumUrl(sampleName, bank) {
+  const { s, n } = parseSampleId(sampleName);
+  return resolveSampleUrl(`${bank}_${s}:${n}`);
+}
+
+/** Download and decode drum samples ahead of time, so their first audition is immediate. */
+export async function preloadDrums(sounds) {
+  if (!initialized || !Array.isArray(sounds)) return;
+  await Promise.all(sounds.map(async ({ sample, bank } = {}) => {
+    if (typeof sample !== 'string' || !SAFE_SAMPLE.test(sample) || !SAFE_BANK.test(bank || '')) return;
+    const url = resolveDrumUrl(sample, bank)?.url;
+    if (url) await loadPreviewBuffer(url)?.catch(() => { });
+  }));
+}
+
+function playOneShot(buffer, level) {
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  const gain = ctx.createGain();
+  gain.gain.value = level;
+  source.connect(gain);
+  gain.connect(ctx.destination);
+  source.onended = () => {
+    try { source.disconnect(); gain.disconnect(); } catch { /* noop */ }
+  };
+  source.start();
+}
+
+/**
+ * Audition a drum sample (or, with `note`, a synth waveform at that MIDI pitch) as a
+ * one-shot, immediately. Nothing is ever evaluated: an evaluated pattern would loop,
+ * replace the running song and only sound on the scheduler's next cycle.
+ */
+export async function previewDrum(sampleName, bank = 'RolandTR808', note) {
+  if (!initialized || !ctx) return;
+  if (typeof sampleName !== 'string' || !SAFE_SAMPLE.test(sampleName)) return;
+  const safeBank = typeof bank === 'string' && SAFE_BANK.test(bank) ? bank : 'RolandTR808';
+  const isSynth = PREVIEW_WAVEFORMS.includes(sampleName) && Number.isFinite(note) && note >= 0 && note <= 127;
   try {
-    await strudelEvaluate(`sound("${sampleName}").bank("RolandTR808").room(0.1)`);
+    if (ctx.state === 'suspended') await ctx.resume?.();
+    if (!isSynth) {
+      const url = resolveDrumUrl(sampleName, safeBank)?.url;
+      if (url) {
+        const requestedAt = Date.now();
+        const buffer = await loadPreviewBuffer(url);
+        if (buffer && Date.now() - requestedAt <= PREVIEW_MAX_WAIT_MS) playOneShot(buffer, 0.8);
+        return;
+      }
+    }
+    if (typeof superdough !== 'function') return;
+    const value = isSynth ? { s: sampleName, note: Math.round(note), gain: 0.5 } : { s: sampleName, bank: safeBank, gain: 0.8 };
+    await superdough(value, ctx.currentTime + PREVIEW_LEAD_SEC, isSynth ? 0.3 : 0.5);
   } catch { /* ignore */ }
 }
 

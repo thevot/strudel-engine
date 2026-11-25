@@ -1,4 +1,4 @@
-name: Build & Publish AGPL Engine
+name: Build & Publish strudel-engine
 
 on:
   push:
