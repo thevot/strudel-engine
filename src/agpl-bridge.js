@@ -9,6 +9,7 @@ import {
   initStrudel,
   evaluate as strudelEvaluate,
   getSound,
+  Pattern,
   superdough,
   samples,
   aliasBank,
@@ -16,6 +17,8 @@ import {
 } from '@strudel/web';
 import { registerSoundfonts } from '@strudel/soundfonts';
 import { createTransportClock } from './transportClock.js';
+import { primeSamples } from './samplePriming.js';
+import { audibleIntervals, gatePattern } from './arrangementGate.js';
 
 let initialized = false;
 let ctx = null;       // AudioContext
@@ -27,10 +30,41 @@ const transportClock = createTransportClock();
 let currentCps = 0.5;
 let engineIsPlaying = false;
 let activePreviewHandle = null;
+let runToken = 0;       // changes when a newer evaluation or Stop overrides a waiting one
+let ungatedSources = []; // tracks as written, collected while gated code is evaluated
+
+let gateInstalled = false;
+
+/**
+ * Make `.__strudawGate(ranges, totalBars)` available to the code evaluateAll() writes.
+ * Installed once per copy of this module: a reloaded module must replace the old method.
+ */
+function installArrangementGate() {
+  if (gateInstalled) return;
+  gateInstalled = true;
+  Object.defineProperty(Pattern.prototype, '__strudawGate', {
+    configurable: true,
+    value(intervals, totalBars) {
+      ungatedSources.push(this);
+      return gatePattern(this, intervals, totalBars);
+    },
+  });
+}
+
+/** The longest init() waits for each optional sample list it needs at the first Play. */
+const SAMPLE_LIST_MAX_WAIT_MS = 3000;
 const previewBufferCache = new Map();
 
-export async function init() {
-  if (initialized) return;
+let initializing = null;
+
+/** Start the engine once; calls made while it starts share the same attempt. */
+export function init() {
+  if (initialized) return Promise.resolve();
+  initializing ??= startEngine().finally(() => { initializing = null; });
+  return initializing;
+}
+
+async function startEngine() {
 
   const STRUDEL_CDN = 'https://strudel.b-cdn.net';
 
@@ -39,10 +73,25 @@ export async function init() {
       const optional = (label, promise) =>
         promise.catch((err) => console.warn(`[AGPLBridge] ${label} unavailable:`, err.message));
 
+      // Wait for an optional list, but never let it hold the engine back
+      const within = (promise) => {
+        let timer;
+        const limit = new Promise((resolve) => { timer = setTimeout(resolve, SAMPLE_LIST_MAX_WAIT_MS); });
+        return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
+      };
+
+      // `piano` is the default instrument of the note editors, so it must exist at the first Play
+      const piano = optional('piano samples', samples(`${STRUDEL_CDN}/piano.json`, `${STRUDEL_CDN}/piano/`));
+
       await Promise.all([
         samples(`${STRUDEL_CDN}/tidal-drum-machines.json`, `${STRUDEL_CDN}/tidal-drum-machines/machines/`),
         samples('github:tidalcycles/dirt-samples'),
+        within(piano),
       ]);
+
+      // The uzu kit redefines `bd`, `hh`, `sd` and more: it comes after dirt-samples so that
+      // it wins, and before the first Play so that those sounds do not change under the song.
+      await within(optional('uzu drumkit', samples(`${STRUDEL_CDN}/uzu-drumkit.json`, `${STRUDEL_CDN}/uzu-drumkit/`)));
 
       try {
         await aliasBank(`${STRUDEL_CDN}/tidal-drum-machines-alias.json`);
@@ -58,9 +107,7 @@ export async function init() {
 
       const loadExtras = () => {
         Promise.all([
-          optional('piano samples', samples(`${STRUDEL_CDN}/piano.json`, `${STRUDEL_CDN}/piano/`)),
           optional('VCSL samples', samples(`${STRUDEL_CDN}/vcsl.json`, `${STRUDEL_CDN}/VCSL/`)),
-          optional('uzu drumkit', samples(`${STRUDEL_CDN}/uzu-drumkit.json`, `${STRUDEL_CDN}/uzu-drumkit/`)),
           optional('uzu wavetables', samples(`${STRUDEL_CDN}/uzu-wavetables.json`, `${STRUDEL_CDN}/uzu-wavetables/`)),
           optional('mridangam samples', samples(`${STRUDEL_CDN}/mridangam.json`, `${STRUDEL_CDN}/mrid/`)),
         ]);
@@ -120,11 +167,35 @@ export async function init() {
   console.log('[AGPLBridge] Strudel Engine AGPL Core Initialized');
 }
 
+/**
+ * Hand code to the scheduler. While it runs the pattern is swapped at once; when it is
+ * stopped, it starts only after the opening samples are downloaded.
+ * @returns {Promise<boolean>} false when Stop or newer code arrived during that wait
+ */
+async function runCode(code) {
+  const token = ++runToken;
+  patternVersion += 1;
+  ungatedSources = [];
+  const scheduler = repl?.scheduler;
+  // A track that enters later in the arrangement needs its samples by then too
+  const primeGatedTracks = () => ungatedSources.splice(0).forEach((track) => primeSamples(track, scheduler?.cps));
+  if (scheduler?.started !== false || typeof scheduler.start !== 'function') {
+    await strudelEvaluate(code);
+    primeGatedTracks();
+    return true;
+  }
+  const pattern = await strudelEvaluate(code, false);
+  primeGatedTracks();
+  if (pattern && token === runToken) await primeSamples(pattern, scheduler.cps);
+  if (token !== runToken) return false;
+  if (pattern) scheduler.start();
+  return true;
+}
+
 export async function evaluate(code) {
   try {
     if (!initialized) await init();
-    patternVersion += 1;
-    await strudelEvaluate(code);
+    if (!await runCode(code)) return { error: null, cancelled: true };
     return { error: null };
   } catch (err) {
     console.error('[AGPLBridge] Evaluation error:', err);
@@ -168,6 +239,9 @@ export async function evaluateAll(tracks, bpm, options = {}) {
       .trim();
 
     if (!code || code === 'silence') return null;
+    // Without an arrangement the code below is the same as for a project that ignores it
+    const arrangement = options.arrangement;
+    const ranges = arrangement ? audibleIntervals(arrangement.clips?.[t.id], arrangement.totalBars) : null;
     let wrapped = `(${code}).gain(${vol.toFixed(2)})`;
     if (pan !== 0) {
       wrapped += `.pan(${pan.toFixed(2)})`;
@@ -189,6 +263,10 @@ export async function evaluateAll(tracks, bpm, options = {}) {
           wrapped += `${INSERT_EFFECTS[ins]}`;
         }
       }
+    }
+    if (ranges) {
+      installArrangementGate();
+      wrapped += `.__strudawGate(${JSON.stringify(ranges)}, ${arrangement.totalBars})`;
     }
     return wrapped;
   }).filter(Boolean);
@@ -213,8 +291,7 @@ export async function evaluateAll(tracks, bpm, options = {}) {
   }
 
   try {
-    patternVersion += 1;
-    await strudelEvaluate(combined);
+    if (!await runCode(combined)) return { error: null, cancelled: true };
     currentCps = bpmToCps(bpm || 120);
     return { error: null };
   } catch (err) {
@@ -226,6 +303,7 @@ export async function evaluateAll(tracks, bpm, options = {}) {
 export async function stop() {
   try {
     if (!initialized) return;
+    runToken += 1; // a Play still waiting for samples must not start afterwards
     // The scheduler itself must stop: `hush()` only swaps in silence and leaves the
     // cycle counter running, so the next Play would start at an arbitrary point.
     if (repl?.stop) repl.stop();
@@ -435,7 +513,19 @@ export function getCurrentCps() { return repl?.scheduler?.cps ?? currentCps; }
 export function setEnginePlayState(playing) { engineIsPlaying = playing; }
 
 export function previewNote(midiNote, durationSec = 0.35) {
-  if (!ctx || ctx.state === 'suspended') return;
+  if (!ctx) return;
+  if (ctx.state !== 'suspended') {
+    playNote(midiNote, durationSec);
+    return;
+  }
+  // A context created after the click that asked for the note may need to be woken.
+  const requestedAt = Date.now();
+  ctx.resume?.()?.then(() => {
+    if (ctx.state !== 'suspended' && Date.now() - requestedAt <= PREVIEW_MAX_WAIT_MS) playNote(midiNote, durationSec);
+  }).catch(() => { });
+}
+
+function playNote(midiNote, durationSec) {
   try {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
