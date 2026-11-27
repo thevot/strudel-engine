@@ -234,7 +234,7 @@ console.log('Evaluation response:', response);
 | :--- | :--- | :--- |
 | `init()` | `async () => Promise<void>` | Initializes Web Audio context and triggers two-tier sample prebaking. |
 | `evaluate(code)` | `async (code: string) => Promise<{ error: string \| null }>` | Evaluates and plays a single Strudel live-coding pattern. |
-| `evaluateAll(tracks, bpm, options)` | `async (tracks: Array, bpm: number, options?: object) => Promise<{ error: string \| null }>` | Stacks and plays multi-track DAW arrangements with per-channel gain, pan, mute/solo, and metronome. |
+| `evaluateAll(tracks, bpm, options)` | `async (tracks: Array, bpm: number, options?: object) => Promise<{ error: string \| null, cancelled?: true }>` | Stacks and plays multi-track DAW arrangements with per-channel gain, pan, mute/solo, and metronome. Use `options.liveUpdate` for changes made while playing: it replaces what is playing and never starts the transport, so an update still on its way at Stop is dropped (`cancelled`). |
 | `stop()` | `async () => Promise<void>` | Safely halts pattern evaluation and silences audio output. |
 | `setCps(cps)` | `async (cps: number) => Promise<void>` | Sets playback speed in Cycles Per Second (CPS). |
 
@@ -254,7 +254,9 @@ console.log('Evaluation response:', response);
 | :--- | :--- | :--- |
 | `getAudioContext()` | `() => AudioContext \| null` | Returns the shared `AudioContext` instance. |
 | `getAnalyser()` | `() => AnalyserNode \| null` | Returns the scoped `AnalyserNode` (2048 FFT) for spectrum and oscilloscopes. |
-| `getMasterTap()` | `() => GainNode \| null` | Returns the non-destructive master tap node for audio metering and recording. |
+| `getMasterTap()` | `() => GainNode \| null` | Returns the non-destructive master tap node for audio metering and recording. It sits before the master gain, so recordings do not depend on how loud playback is. |
+| `setMasterGain(gain)` | `(gain: number) => void` | Listening volume, from `0` (silent) to `1` (unchanged, the default), applied with a short ramp to everything the engine plays, previews included. Can be called before `init()`. The analyser sits after it, the master tap before it. |
+| `isMasterVolumeAvailable()` | `() => boolean` | `false` only when the engine started without being able to route superdough's output through the master gain. |
 | `isInitialized()` | `() => boolean` | Checks if the engine and audio context are ready. |
 | `getCyclePosition()` | `() => number \| null` | Cycle position currently **audible** (scheduler latency and device output latency included), or `null` when stopped. Drive playheads from this. |
 | `getPatternVersion()` | `() => number` | Changes whenever new code takes over playback. |

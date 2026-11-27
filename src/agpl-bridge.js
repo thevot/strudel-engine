@@ -14,6 +14,7 @@ import {
   samples,
   aliasBank,
   getAudioContext as getStrudelCtx,
+  getSuperdoughAudioController,
 } from '@strudel/web';
 import { registerSoundfonts } from '@strudel/soundfonts';
 import { createTransportClock } from './transportClock.js';
@@ -24,6 +25,11 @@ let initialized = false;
 let ctx = null;       // AudioContext
 let analyser = null;  // AnalyserNode for visualizations
 let masterTap = null; // GainNode mirroring the master bus
+let masterBus = null;   // everything the engine plays goes in here
+let masterGain = null;  // listening volume: the last node before the speakers
+let masterLevel = 1;    // its gain, kept so that it can be set before the engine starts
+/** How long a change of the listening volume takes: a sudden step would click. */
+const MASTER_RAMP_SEC = 0.03;
 let repl = null;      // Strudel repl: owns the scheduler
 let patternVersion = 0; // bumped whenever new code takes over the scheduler
 const transportClock = createTransportClock();
@@ -145,7 +151,8 @@ async function startEngine() {
           this.context === ctx &&
           destination === ctx.destination &&
           this !== analyser &&
-          this !== masterTap
+          this !== masterTap &&
+          this !== masterGain // already feeds the analyser; the export must not hear it
         ) {
           try { origConnect.call(this, analyser); } catch { /* noop */ }
           try { origConnect.call(this, masterTap); } catch { /* noop */ }
@@ -160,6 +167,8 @@ async function startEngine() {
       });
     }
 
+    buildMasterBus();
+
     console.log('[AGPLBridge] AudioContext and Analyser hooked successfully');
   }
 
@@ -168,17 +177,86 @@ async function startEngine() {
 }
 
 /**
+ * Put the listening volume between everything the engine plays and the speakers:
+ *
+ *   superdough output + previews ──> masterBus ──> masterGain ──> speakers
+ *                                        │              │
+ *                                        └> masterTap   └> analyser
+ *                                           (export)       (scopes, meters)
+ *
+ * The export tap sits before the volume, so listening quietly never changes an export.
+ * When superdough's output is out of reach the audio keeps its direct route (tapped as
+ * above) and there is no volume control.
+ */
+function buildMasterBus() {
+  try {
+    const output = getSuperdoughAudioController().output.destinationGain;
+    if (output?.context !== ctx) throw new Error('superdough output not found on this AudioContext');
+    const bus = ctx.createGain();
+    masterGain = ctx.createGain(); // assigned before it connects, so the destination tap skips it
+    masterGain.gain.value = masterLevel;
+    bus.connect(masterGain);
+    bus.connect(masterTap);
+    masterGain.connect(analyser);
+    masterGain.connect(ctx.destination);
+    output.disconnect();
+    output.connect(bus);
+    masterBus = bus;
+  } catch (err) {
+    masterGain = null;
+    console.warn('[AGPLBridge] Master volume unavailable:', err.message);
+  }
+}
+
+/** Where the engine's own sounds go: through the listening volume when there is one. */
+const appOutput = () => masterBus ?? ctx.destination;
+
+/**
+ * Listening volume as a gain from 0 (silent) to 1 (unchanged). It affects what is heard,
+ * not what the export tap records, and can be set before the engine starts.
+ */
+export function setMasterGain(value) {
+  if (!Number.isFinite(value)) return;
+  masterLevel = Math.min(1, Math.max(0, value));
+  if (!masterGain) return;
+  const param = masterGain.gain;
+  if (ctx.state === 'running' && typeof param.linearRampToValueAtTime === 'function') {
+    const now = ctx.currentTime;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(param.value, now);
+    param.linearRampToValueAtTime(masterLevel, now + MASTER_RAMP_SEC);
+  } else {
+    // The clock stands still: a ramp would wait for it
+    param.cancelScheduledValues?.(0);
+    param.value = masterLevel;
+  }
+}
+
+/** False only when the engine started without being able to place its volume control. */
+export function isMasterVolumeAvailable() { return !initialized || masterGain !== null; }
+
+/**
  * Hand code to the scheduler. While it runs the pattern is swapped at once; when it is
  * stopped, it starts only after the opening samples are downloaded.
- * @returns {Promise<boolean>} false when Stop or newer code arrived during that wait
+ * A `liveUpdate` only replaces what is playing: it never starts the transport, so one
+ * that was already on its way when Stop was pressed cannot bring the sound back.
+ * @returns {Promise<boolean>} false when Stop or newer code arrived during a wait, and
+ * for a live update that finds the transport stopped
  */
-async function runCode(code) {
+async function runCode(code, { liveUpdate = false } = {}) {
+  const scheduler = repl?.scheduler;
+  // Dropped before it takes a token: a Play still loading its samples must go on.
+  if (liveUpdate && scheduler?.started === false) return false;
   const token = ++runToken;
   patternVersion += 1;
   ungatedSources = [];
-  const scheduler = repl?.scheduler;
   // A track that enters later in the arrangement needs its samples by then too
   const primeGatedTracks = () => ungatedSources.splice(0).forEach((track) => primeSamples(track, scheduler?.cps));
+  if (liveUpdate) {
+    await strudelEvaluate(code, false); // false: Strudel must not start the scheduler
+    primeGatedTracks();
+    return token === runToken;
+  }
   if (scheduler?.started !== false || typeof scheduler.start !== 'function') {
     await strudelEvaluate(code);
     primeGatedTracks();
@@ -192,10 +270,10 @@ async function runCode(code) {
   return true;
 }
 
-export async function evaluate(code) {
+export async function evaluate(code, { liveUpdate = false } = {}) {
   try {
     if (!initialized) await init();
-    if (!await runCode(code)) return { error: null, cancelled: true };
+    if (!await runCode(code, { liveUpdate })) return { error: null, cancelled: true };
     return { error: null };
   } catch (err) {
     console.error('[AGPLBridge] Evaluation error:', err);
@@ -211,6 +289,7 @@ export async function evaluateAll(tracks, bpm, options = {}) {
     return { error: `Engine init failed: ${err.message || String(err)}` };
   }
 
+  const run = { liveUpdate: options.liveUpdate === true };
   const hasSolo = tracks.some(t => t.solo);
   const activeTracks = tracks.filter(t => {
     if (hasSolo) return t.solo && !t.muted;
@@ -218,7 +297,7 @@ export async function evaluateAll(tracks, bpm, options = {}) {
   });
 
   if (activeTracks.length === 0) {
-    return evaluate('silence');
+    return evaluate('silence', run);
   }
 
   const tempoRegex = /^\s*set(?:cpm|cps)\s*\([^)]+\)\s*;?\s*$/gm;
@@ -272,7 +351,7 @@ export async function evaluateAll(tracks, bpm, options = {}) {
   }).filter(Boolean);
 
   if (wrappedParts.length === 0) {
-    return evaluate('silence');
+    return evaluate('silence', run);
   }
 
   const tempoLine = tempoStatements.length > 0
@@ -291,7 +370,7 @@ export async function evaluateAll(tracks, bpm, options = {}) {
   }
 
   try {
-    if (!await runCode(combined)) return { error: null, cancelled: true };
+    if (!await runCode(combined, run)) return { error: null, cancelled: true };
     currentCps = bpmToCps(bpm || 120);
     return { error: null };
   } catch (err) {
@@ -411,7 +490,7 @@ export async function previewSound(sampleName) {
       gain.gain.value = 1;
 
       source.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(appOutput());
 
       let disconnected = false;
       const disconnectAll = () => {
@@ -536,7 +615,7 @@ function playNote(midiNote, durationSec) {
     gain.gain.linearRampToValueAtTime(0.35, ctx.currentTime + 0.01);
     gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + durationSec);
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(appOutput());
     osc.start(ctx.currentTime);
     osc.stop(ctx.currentTime + durationSec + 0.05);
   } catch { /* ignore */ }
@@ -572,7 +651,7 @@ function playOneShot(buffer, level) {
   const gain = ctx.createGain();
   gain.gain.value = level;
   source.connect(gain);
-  gain.connect(ctx.destination);
+  gain.connect(appOutput());
   source.onended = () => {
     try { source.disconnect(); gain.disconnect(); } catch { /* noop */ }
   };
